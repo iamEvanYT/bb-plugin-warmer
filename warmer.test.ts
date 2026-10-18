@@ -8,11 +8,15 @@ const minute = 60_000;
 function setup(t: TestContext) {
   t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
   let thread = makeThreadResponse({ id: "t1", status: "idle", runtime: { displayStatus: "idle" } });
+  let lastResponseAt: number | null = Date.now();
   let interactions: Awaited<ReturnType<typeof bb.sdk.threads.interactions.list>> = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "warmer",
     sdk: { threads: {
       get: async () => thread,
+      events: { list: async () => lastResponseAt === null ? [] : [{
+        type: "turn/completed", createdAt: lastResponseAt, data: { status: "completed" },
+      }] },
       interactions: { list: async () => interactions },
       send: async () => ({ ok: true, delivery: "sent" }),
     } },
@@ -23,7 +27,9 @@ function setup(t: TestContext) {
     bb, harness, warmer,
     advance: (minutes: number) => t.mock.timers.tick(minutes * minute),
     sent: () => harness.inspection.sdk.callsTo("threads.send"),
+    setLastResponseAt: (at: number | null) => { lastResponseAt = at; },
     setThread: (overrides: Partial<typeof thread>) => {
+      if (overrides.status === "idle" && thread.status !== "idle") lastResponseAt = Date.now();
       thread = { ...thread, ...overrides };
       warmer.observe(thread);
     },
@@ -58,7 +64,7 @@ test("opt-in, exact default interval/message, repeated idle turns, and thread is
   assert.equal(s.sent().length, 2);
 });
 
-test("activity resets the idle countdown", async (t) => {
+test("a new completed response starts the next interval", async (t) => {
   const s = setup(t);
   await s.warmer.setEnabled("t1", true);
   s.advance(54);
@@ -93,7 +99,7 @@ for (const [name, overrides] of Object.entries({
   });
 }
 
-test("pending interactions pause warming even if the runtime reports idle", async (t) => {
+test("resolving a pending interaction does not reset elapsed time since the response", async (t) => {
   const s = setup(t);
   await s.warmer.setEnabled("t1", true);
   s.block(true);
@@ -101,8 +107,6 @@ test("pending interactions pause warming even if the runtime reports idle", asyn
   await s.warmer.tick();
   assert.equal(s.sent().length, 0);
   s.block(false);
-  await s.warmer.tick();
-  s.advance(55);
   await s.warmer.tick();
   assert.equal(s.sent().length, 1);
 });
@@ -188,13 +192,87 @@ test("settings changes during a due check prevent delivery on the old interval",
   await s.warmer.setEnabled("t1", true);
   s.advance(55);
   let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>((resolve) => { entered = resolve; });
   s.harness.inspection.sdk.stub("threads.interactions.list", () => new Promise((resolve) => {
     release = () => resolve([]);
+    entered();
   }));
   const check = s.warmer.tick();
-  await Promise.resolve();
+  await pending;
   s.warmer.updateSettings({ intervalMinutes: 60, message: DEFAULT_MESSAGE });
   release();
   await check;
+  assert.equal(s.sent().length, 0);
+});
+
+test("enabling after the interval elapsed warms on the next check, not another interval later", async (t) => {
+  const s = setup(t);
+  s.warmer.updateSettings({ intervalMinutes: 2, message: DEFAULT_MESSAGE });
+  const responseAt = Date.now();
+  s.advance(3);
+  await s.warmer.setEnabled("t1", true);
+  assert.equal(s.warmer.status("t1").nextWarmAt, responseAt + 2 * minute);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 1);
+  // Until a new response arrives, do not warm the same response twice.
+  s.advance(3);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 1);
+  s.setLastResponseAt(Date.now());
+  await s.warmer.tick();
+  s.advance(2);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 2);
+});
+
+test("enabling partway through an idle interval retains elapsed response time", async (t) => {
+  const s = setup(t);
+  s.warmer.updateSettings({ intervalMinutes: 2, message: DEFAULT_MESSAGE });
+  s.advance(1.5);
+  await s.warmer.setEnabled("t1", true);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 0);
+  s.advance(0.5);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 1);
+});
+
+test("a delayed idle notification uses response history rather than notification time", async (t) => {
+  const s = setup(t);
+  s.warmer.updateSettings({ intervalMinutes: 2, message: DEFAULT_MESSAGE });
+  await s.warmer.setEnabled("t1", true);
+  s.setThread({ status: "active", runtime: { displayStatus: "active" } });
+  s.advance(1);
+  const responseAt = Date.now();
+  s.advance(1.5);
+  s.setThread({ status: "idle", runtime: { displayStatus: "idle" } });
+  s.setLastResponseAt(responseAt);
+  await s.warmer.tick();
+  assert.equal(s.warmer.status("t1").nextWarmAt, responseAt + 2 * minute);
+  assert.equal(s.sent().length, 0);
+  s.advance(0.5);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 1);
+});
+
+test("thread metadata updates do not postpone the response deadline", async (t) => {
+  const s = setup(t);
+  s.warmer.updateSettings({ intervalMinutes: 2, message: DEFAULT_MESSAGE });
+  await s.warmer.setEnabled("t1", true);
+  s.advance(1.5);
+  s.setThread({ title: "Renamed", updatedAt: Date.now() });
+  s.advance(0.5);
+  await s.warmer.tick();
+  assert.equal(s.sent().length, 1);
+});
+
+test("threads without a completed response are not warmed", async (t) => {
+  const s = setup(t);
+  s.setLastResponseAt(null);
+  await s.warmer.setEnabled("t1", true);
+  s.advance(100);
+  await s.warmer.tick();
+  assert.equal(s.warmer.status("t1").nextWarmAt, null);
   assert.equal(s.sent().length, 0);
 });

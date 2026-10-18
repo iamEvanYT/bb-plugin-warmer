@@ -6,7 +6,16 @@ import plugin from "./server.ts";
 const thread = makeThreadResponse({ id: "t1", status: "idle", runtime: { displayStatus: "idle" } });
 
 test("settings, RPC, CLI, events and reload preserve only the global settings", async (t) => {
-  const { bb, harness } = createFakePluginHost({ pluginId: "warmer", sdk: { threads: { get: async () => thread } } });
+  const responseAt = Date.now();
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "warmer",
+    sdk: { threads: {
+      get: async () => thread,
+      events: { list: async () => [{
+        type: "turn/completed", createdAt: responseAt, data: { status: "completed" },
+      }] },
+    } },
+  });
   t.after(() => harness.lifecycle.dispose());
   await plugin(bb);
   assert.deepEqual(await harness.behavior.callRpc("list", null), { enabledThreadIds: [] });

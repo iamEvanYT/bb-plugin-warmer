@@ -15,7 +15,11 @@ Thread opt-ins are held in memory. A BB restart, plugin reload, or plugin disabl
 
 ## Behavior
 
-Enabling starts a fresh countdown if the thread is idle. Active work, queued messages, pending interactions, background agents, and unavailable runtimes pause the countdown. A new idle period starts a full countdown. Warm messages use the thread's existing provider, model, and execution settings. They appear as ordinary messages in the conversation.
+The interval is measured from the latest completed response in the thread history. Enabling warming counts time the thread was already idle. If the interval has already elapsed, a warm message is sent on the next check.
+
+Active work, queued messages, pending interactions, background agents, and unavailable runtimes block sending without resetting that response timestamp. A new completed response starts the next interval. Threads with no completed response are not warmed.
+
+Warm messages use the thread's existing provider, model, and execution settings. They appear as ordinary messages in the conversation.
 
 A single background service checks opted-in threads every five seconds. There are no persistent schedules or per-thread metadata writes. Missed checks, including machine sleep, produce at most one warm message on resumption. Failed delivery waits another full interval before retrying. If BB queues a warm message instead of sending it immediately, the plugin cancels that queued message. Provider cache retention depends on the provider; this plugin sends messages and does not configure provider caching.
 
